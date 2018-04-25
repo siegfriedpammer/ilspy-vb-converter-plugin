@@ -1,0 +1,6 @@
+bin/
+obj/
+/ILSpy
+*.user
+.vs/
+packages/
