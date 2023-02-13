@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.IO;
 using System.Linq;
+using System.Reflection.Metadata;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -12,6 +13,7 @@ using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.OutputVisitor;
 using ICSharpCode.Decompiler.CSharp.Syntax;
 using ICSharpCode.Decompiler.CSharp.Transforms;
+using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
 using ICSharpCode.ILSpy;
 using Mono.Cecil;
@@ -21,14 +23,32 @@ namespace ILSpy.VB.AddIn
 	[Export(typeof(Language))]
 	public class CSharpConvertedToVBLanguage : Language
 	{
-		public override string Name => "VB (converted from C#)";
+		string name = "VB.NET";
+		bool showAllMembers = false;
+		int transformCount = int.MaxValue;
 
-		public override string FileExtension => ".vb";
+		public override string Name {
+			get { return name; }
+		}
 
-		CSharpDecompiler CreateDecompiler(ModuleDefinition module, DecompilationOptions options)
+		public override string FileExtension {
+			get { return ".vb"; }
+		}
+
+		public override string ProjectFileExtension {
+			get { return ".vbproj"; }
+		}
+
+		CSharpDecompiler CreateDecompiler(PEFile module, DecompilationOptions options)
 		{
-			CSharpDecompiler decompiler = new CSharpDecompiler(module, options.DecompilerSettings);
+			CSharpDecompiler decompiler = new CSharpDecompiler(module, module.GetAssemblyResolver(), options.DecompilerSettings);
 			decompiler.CancellationToken = options.CancellationToken;
+			decompiler.DebugInfoProvider = module.GetDebugInfoOrNull();
+			while (decompiler.AstTransforms.Count > transformCount)
+				decompiler.AstTransforms.RemoveAt(decompiler.AstTransforms.Count - 1);
+			if (options.EscapeInvalidIdentifiers) {
+				decompiler.AstTransforms.Add(new EscapeInvalidIdentifiers());
+			}
 			return decompiler;
 		}
 
@@ -44,18 +64,20 @@ namespace ILSpy.VB.AddIn
 				output.Write(converted.GetExceptionsAsString());
 		}
 
-		public override void DecompileMethod(MethodDefinition method, ITextOutput output, DecompilationOptions options)
+		public override void DecompileMethod(IMethod method, ITextOutput output, DecompilationOptions options)
 		{
-			AddReferenceWarningMessage(method.Module.Assembly, output);
+			PEFile assembly = method.ParentModule.PEFile;
+			AddReferenceWarningMessage(assembly, output);
 			WriteCommentLine(output, "NOTE: This code was converted from C# to VB.");
 			WriteCommentLine(output, TypeToString(method.DeclaringType, includeNamespace: true));
-			CSharpDecompiler decompiler = CreateDecompiler(method.Module, options);
-			if (method.IsConstructor && !method.DeclaringType.IsValueType) {
-				List<IMemberDefinition> members = CollectFieldsAndCtors(method.DeclaringType, method.IsStatic);
-				decompiler.AstTransforms.Add(new SelectCtorTransform(decompiler.TypeSystem.Resolve(method)));
+			CSharpDecompiler decompiler = CreateDecompiler(assembly, options);
+			var methodDefinition = decompiler.TypeSystem.MainModule.ResolveEntity(method.MetadataToken) as IMethod;
+			if (methodDefinition.IsConstructor && methodDefinition.DeclaringType.IsReferenceType != false) {
+				var members = CollectFieldsAndCtors(methodDefinition.DeclaringTypeDefinition, methodDefinition.IsStatic);
+				decompiler.AstTransforms.Add(new SelectCtorTransform(methodDefinition));
 				WriteCode(output, options.DecompilerSettings, decompiler.Decompile(members), decompiler.TypeSystem);
 			} else {
-				WriteCode(output, options.DecompilerSettings, decompiler.Decompile(method), decompiler.TypeSystem);
+				WriteCode(output, options.DecompilerSettings, decompiler.Decompile(method.MetadataToken), decompiler.TypeSystem);
 			}
 		}
 
@@ -110,40 +132,43 @@ namespace ILSpy.VB.AddIn
 			}
 		}
 
-		public override void DecompileProperty(PropertyDefinition property, ITextOutput output, DecompilationOptions options)
+		public override void DecompileProperty(IProperty property, ITextOutput output, DecompilationOptions options)
 		{
-			AddReferenceWarningMessage(property.Module.Assembly, output);
+			PEFile assembly = property.ParentModule.PEFile;
+			AddReferenceWarningMessage(assembly, output);
 			WriteCommentLine(output, "NOTE: This code was converted from C# to VB.");
 			WriteCommentLine(output, TypeToString(property.DeclaringType, includeNamespace: true));
-			CSharpDecompiler decompiler = CreateDecompiler(property.Module, options);
-			WriteCode(output, options.DecompilerSettings, decompiler.Decompile(property), decompiler.TypeSystem);
+			CSharpDecompiler decompiler = CreateDecompiler(assembly, options);
+			WriteCode(output, options.DecompilerSettings, decompiler.Decompile(property.MetadataToken), decompiler.TypeSystem);
 		}
 
-		public override void DecompileField(FieldDefinition field, ITextOutput output, DecompilationOptions options)
+		public override void DecompileField(IField field, ITextOutput output, DecompilationOptions options)
 		{
-			AddReferenceWarningMessage(field.Module.Assembly, output);
+			PEFile assembly = field.ParentModule.PEFile;
+			AddReferenceWarningMessage(assembly, output);
 			WriteCommentLine(output, "NOTE: This code was converted from C# to VB.");
 			WriteCommentLine(output, TypeToString(field.DeclaringType, includeNamespace: true));
-			CSharpDecompiler decompiler = CreateDecompiler(field.Module, options);
-			if (field.IsLiteral) {
-				WriteCode(output, options.DecompilerSettings, decompiler.Decompile(field), decompiler.TypeSystem);
+			CSharpDecompiler decompiler = CreateDecompiler(assembly, options);
+			if (field.IsConst) {
+				WriteCode(output, options.DecompilerSettings, decompiler.Decompile(field.MetadataToken), decompiler.TypeSystem);
 			} else {
-				List<IMemberDefinition> members = CollectFieldsAndCtors(field.DeclaringType, field.IsStatic);
-				decompiler.AstTransforms.Add(new SelectFieldTransform(decompiler.TypeSystem.Resolve(field)));
+				var members = CollectFieldsAndCtors(field.DeclaringTypeDefinition, field.IsStatic);
+				var resolvedField = decompiler.TypeSystem.MainModule.GetDefinition((FieldDefinitionHandle)field.MetadataToken);
+				decompiler.AstTransforms.Add(new SelectFieldTransform(resolvedField));
 				WriteCode(output, options.DecompilerSettings, decompiler.Decompile(members), decompiler.TypeSystem);
 			}
 		}
 
-		private static List<IMemberDefinition> CollectFieldsAndCtors(TypeDefinition type, bool isStatic)
+		private static List<EntityHandle> CollectFieldsAndCtors(ITypeDefinition type, bool isStatic)
 		{
-			var members = new List<IMemberDefinition>();
+			var members = new List<EntityHandle>();
 			foreach (var field in type.Fields) {
-				if (field.IsStatic == isStatic)
-					members.Add(field);
+				if (!field.MetadataToken.IsNil && field.IsStatic == isStatic)
+					members.Add(field.MetadataToken);
 			}
 			foreach (var ctor in type.Methods) {
-				if (ctor.IsConstructor && ctor.IsStatic == isStatic)
-					members.Add(ctor);
+				if (!ctor.MetadataToken.IsNil && ctor.IsConstructor && ctor.IsStatic == isStatic)
+					members.Add(ctor.MetadataToken);
 			}
 
 			return members;
@@ -178,57 +203,59 @@ namespace ILSpy.VB.AddIn
 			}
 		}
 
-		public override void DecompileEvent(EventDefinition ev, ITextOutput output, DecompilationOptions options)
+		public override void DecompileEvent(IEvent @event, ITextOutput output, DecompilationOptions options)
 		{
-			AddReferenceWarningMessage(ev.Module.Assembly, output);
+			PEFile assembly = @event.ParentModule.PEFile;
+			AddReferenceWarningMessage(assembly, output);
 			WriteCommentLine(output, "NOTE: This code was converted from C# to VB.");
-			WriteCommentLine(output, TypeToString(ev.DeclaringType, includeNamespace: true));
-			CSharpDecompiler decompiler = CreateDecompiler(ev.Module, options);
-			WriteCode(output, options.DecompilerSettings, decompiler.Decompile(ev), decompiler.TypeSystem);
+			WriteCommentLine(output, TypeToString(@event.DeclaringType, includeNamespace: true));
+			CSharpDecompiler decompiler = CreateDecompiler(assembly, options);
+			WriteCode(output, options.DecompilerSettings, decompiler.Decompile(@event.MetadataToken), decompiler.TypeSystem);
 		}
 
-		public override void DecompileType(TypeDefinition type, ITextOutput output, DecompilationOptions options)
+		public override void DecompileType(ITypeDefinition type, ITextOutput output, DecompilationOptions options)
 		{
-			AddReferenceWarningMessage(type.Module.Assembly, output);
+			PEFile assembly = type.ParentModule.PEFile;
+			AddReferenceWarningMessage(assembly, output);
 			WriteCommentLine(output, "NOTE: This code was converted from C# to VB.");
 			WriteCommentLine(output, TypeToString(type, includeNamespace: true));
-			CSharpDecompiler decompiler = CreateDecompiler(type.Module, options);
-			WriteCode(output, options.DecompilerSettings, decompiler.Decompile(type), decompiler.TypeSystem);
+			CSharpDecompiler decompiler = CreateDecompiler(assembly, options);
+			WriteCode(output, options.DecompilerSettings, decompiler.Decompile(type.MetadataToken), decompiler.TypeSystem);
 		}
 
-		void AddReferenceWarningMessage(AssemblyDefinition assembly, ITextOutput output)
+		void AddReferenceWarningMessage(PEFile module, ITextOutput output)
 		{
-			var loadedAssembly = MainWindow.Instance.CurrentAssemblyList.GetAssemblies().FirstOrDefault(la => la.GetAssemblyDefinitionOrNull() == assembly);
+			var loadedAssembly = MainWindow.Instance.CurrentAssemblyList.GetAssemblies().FirstOrDefault(la => la.GetPEFileOrNull() == module);
 			if (loadedAssembly == null || !loadedAssembly.LoadedAssemblyReferencesInfo.HasErrors)
 				return;
 			const string line1 = "Warning: Some assembly references could not be loaded. This might lead to incorrect decompilation of some parts,";
 			const string line2 = "for ex. property getter/setter access. To get optimal decompilation results, please manually add the references to the list of loaded assemblies.";
 			/*if (output is ISmartTextOutput fancyOutput)
-            {
-                fancyOutput.AddUIElement(() => new StackPanel
-                {
-                    Margin = new Thickness(5),
-                    Orientation = Orientation.Horizontal,
-                    Children = {
-                        new Image {
-                            Width = 32,
-                            Height = 32,
-                            Source = Images.LoadImage(this, "Images/Warning.png")
-                        },
-                        new TextBlock {
-                            Margin = new Thickness(5, 0, 0, 0),
-                            Text = line1 + Environment.NewLine + line2
-                        }
-                    }
-                });
-                fancyOutput.WriteLine();
-                fancyOutput.AddButton(Images.ViewCode, "Show assembly load log", delegate {
-                    MainWindow.Instance.SelectNode(MainWindow.Instance.FindTreeNode(assembly).Children.OfType<ReferenceFolderTreeNode>().First());
-                });
-                fancyOutput.WriteLine();
-            }
-            else
-            {*/
+			{
+				fancyOutput.AddUIElement(() => new StackPanel
+				{
+					Margin = new Thickness(5),
+					Orientation = Orientation.Horizontal,
+					Children = {
+						new Image {
+							Width = 32,
+							Height = 32,
+							Source = Images.LoadImage(this, "Images/Warning.png")
+						},
+						new TextBlock {
+							Margin = new Thickness(5, 0, 0, 0),
+							Text = line1 + Environment.NewLine + line2
+						}
+					}
+				});
+				fancyOutput.WriteLine();
+				fancyOutput.AddButton(Images.ViewCode, "Show assembly load log", delegate {
+					MainWindow.Instance.SelectNode(MainWindow.Instance.FindTreeNode(assembly).Children.OfType<ReferenceFolderTreeNode>().First());
+				});
+				fancyOutput.WriteLine();
+			}
+			else
+			{*/
 			WriteCommentLine(output, line1);
 			WriteCommentLine(output, line2);
 			//}
